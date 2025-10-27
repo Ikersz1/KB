@@ -4,7 +4,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from typing import List
 from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode
-import os, asyncio
+import os, asyncio, re
 
 # Crawl4AI 0.7.x
 from crawl4ai import AsyncWebCrawler, CrawlerRunConfig
@@ -12,8 +12,9 @@ from crawl4ai.content_scraping_strategy import LXMLWebScrapingStrategy
 
 # ================== Config ==================
 PAGE_TIMEOUT = int(os.getenv("CRAWL_PAGE_TIMEOUT", "20"))  # segundos
+MIN_TEXT_LEN = int(os.getenv("CRAWL_MIN_TEXT", "150"))     # mínimo de caracteres útiles
 
-app = FastAPI(title="Crawl4AI Microservice", version="0.1.0")
+app = FastAPI(title="Crawl4AI Microservice", version="0.2.0")
 
 # CORS abierto (ajústalo si quieres limitar orígenes)
 app.add_middleware(
@@ -54,8 +55,6 @@ async def arun_with_timeout(crawler, url: str, cfg, timeout_s: int = PAGE_TIMEOU
     """Lanza crawler.arun con un límite duro por URL."""
     try:
         return await asyncio.wait_for(crawler.arun(url=url, config=cfg), timeout=timeout_s)
-    except asyncio.TimeoutError:
-        return None
     except Exception:
         return None
 
@@ -75,11 +74,10 @@ def pick_text(page) -> str:
     # 2) fallback a html
     html = getattr(page, "html", None)
     if isinstance(html, str) and html.strip():
-        import re as _re
-        s = _re.sub(r"(?is)<(script|style|noscript).*?>.*?</\1>", "", html)
-        s = _re.sub(r"(?is)<[^>]+>", "\n", s)
-        s = _re.sub(r"[ \t]+\n", "\n", s)
-        s = _re.sub(r"\n{3,}", "\n\n", s)
+        s = re.sub(r"(?is)<(script|style|noscript).*?>.*?</\1>", "", html)
+        s = re.sub(r"(?is)<[^>]+>", "\n", s)
+        s = re.sub(r"[ \t]+\n", "\n", s)
+        s = re.sub(r"\n{3,}", "\n\n", s)
         return s.strip()
     return ""
 
@@ -213,11 +211,11 @@ async def fetch_one(inp: FetchIn):
 @app.post("/crawl", response_model=CrawlOut)
 async def crawl_site(inp: CrawlIn):
     """
-    BFS con control de límite y filtros. Cuenta solo páginas con texto >= 300 chars.
+    BFS con control de límite y filtros. Cuenta solo páginas con texto >= MIN_TEXT_LEN.
     Se aplica timeout por página para evitar bloqueos largos.
+    Si no se obtiene nada, hay fallback a la seed.
     """
     from urllib.parse import urljoin
-    import re
 
     seed = normalize_url(inp.url.strip())
     if not seed:
@@ -236,9 +234,8 @@ async def crawl_site(inp: CrawlIn):
             if isinstance(val, (list, tuple, set)):
                 for it in val:
                     href = (it.get("href") if isinstance(it, dict) else str(it)).strip() if it else ""
-                    if not href:
-                        continue
-                    out.add(urljoin(page_url, href))
+                    if href:
+                        out.add(urljoin(page_url, href))
         html = getattr(res, "html", None)
         if isinstance(html, str) and "<a" in html:
             for m in re.finditer(r'href\s*=\s*["\']([^"\']+)["\']', html, flags=re.I):
@@ -275,11 +272,10 @@ async def crawl_site(inp: CrawlIn):
                 continue
 
             title = _title(res)
-            text = pick_text(res)
-            clean = (text or "").strip()
+            text = (pick_text(res) or "").strip()
 
-            if len(clean) >= 300:
-                items.append({"url": page_url, "title": title, "markdown": clean})
+            if len(text) >= MIN_TEXT_LEN:
+                items.append({"url": page_url, "title": title, "markdown": text})
                 if len(items) >= limit:
                     break
 
@@ -293,5 +289,16 @@ async def crawl_site(inp: CrawlIn):
                     if not should_visit(seed, cand):
                         continue
                     queue.append((cand, depth + 1))
+
+    # ---- Fallback: si no hubo items, intenta devolver al menos la seed ----
+    if not items:
+        cfg = CrawlerRunConfig(scraping_strategy=LXMLWebScrapingStrategy())
+        async with AsyncWebCrawler() as crawler:
+            res = await arun_with_timeout(crawler, seed, cfg, PAGE_TIMEOUT)
+        if res:
+            title = _title(res)
+            text = (pick_text(res) or "").strip()
+            if len(text) >= max(60, MIN_TEXT_LEN // 2):
+                items.append({"url": seed, "title": title, "markdown": text})
 
     return CrawlOut(ok=True, data={"items": items})
