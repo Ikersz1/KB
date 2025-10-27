@@ -7,16 +7,17 @@ from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode, urljoin
 import os, re, asyncio
 
 # ======= Modo y límites por ENV =======
-FAST_MODE = os.getenv("FAST_MODE", "0") == "1"          # Render: pon 1
-PAGE_TIMEOUT = int(os.getenv("CRAWL_PAGE_TIMEOUT", "20"))
+FAST_MODE = os.getenv("FAST_MODE", "0") == "1"          # En Render: 0 si necesitas JS; 1 si quieres solo httpx+lxml
+PAGE_TIMEOUT = int(os.getenv("CRAWL_PAGE_TIMEOUT", "20"))  # en segundos (se convierte a ms si usa Playwright)
 MIN_TEXT_LEN = int(os.getenv("CRAWL_MIN_TEXT", "300"))
+CRAWL_MAX_CONCURRENCY = int(os.getenv("CRAWL_MAX_CONCURRENCY", "2"))
 
 # ======= (Solo si no es FAST_MODE) Crawl4AI =======
 if not FAST_MODE:
     from crawl4ai import AsyncWebCrawler, CrawlerRunConfig
     from crawl4ai.content_scraping_strategy import LXMLWebScrapingStrategy
 
-app = FastAPI(title="Crawl Microservice", version="0.2.0")
+app = FastAPI(title="Crawl Microservice", version="0.2.1")
 
 app.add_middleware(
     CORSMiddleware,
@@ -27,6 +28,11 @@ app.add_middleware(
 @app.get("/health")
 def health():
     return {"ok": True, "fast": FAST_MODE}
+
+# ✅ Evita 404 en / (Render hace HEAD/GET a / a veces)
+@app.get("/")
+def root():
+    return {"ok": True, "service": "crawl", "fast": FAST_MODE}
 
 # =============== Schemas ===============
 class FetchIn(BaseModel):
@@ -178,7 +184,6 @@ if FAST_MODE:
                 if not a: continue
                 out.add(urljoin(base_url, a.strip()))
         except:
-            # fallback rápido por regex
             for m in re.finditer(r'href\s*=\s*["\']([^"\']+)["\']', html_text, flags=re.I):
                 out.add(urljoin(base_url, m.group(1).strip()))
         return out
@@ -192,9 +197,13 @@ async def fetch_one(inp: FetchIn):
         txt = strip_html(html_text) if html_text else ""
         return FetchOut(ok=True, data=FetchOutItem(url=url, title="", markdown=txt))
 
-    # Modo completo (tu original)
-    cfg = CrawlerRunConfig(scraping_strategy=LXMLWebScrapingStrategy())
-    async with AsyncWebCrawler() as crawler:
+    # Modo completo (Playwright)
+    cfg = CrawlerRunConfig(
+        scraping_strategy=LXMLWebScrapingStrategy(),
+        wait_until="domcontentloaded",
+        page_timeout=max(60_000, PAGE_TIMEOUT * 1000),  # ms
+    )
+    async with AsyncWebCrawler(max_concurrency=CRAWL_MAX_CONCURRENCY) as crawler:
         res = await crawler.arun(url=inp.url, config=cfg)
 
     txt = pick_text_from_obj(res)
@@ -226,7 +235,7 @@ async def crawl_site(inp: CrawlIn):
     if FAST_MODE:
         while queue and len(items) < limit:
             url, depth = queue.pop(0)
-            if not url or url in seen: 
+            if not url or url in seen:
                 continue
             seen.add(url)
             if _blocked_path(url, deny): 
@@ -258,9 +267,13 @@ async def crawl_site(inp: CrawlIn):
 
         return CrawlOut(ok=True, data={"items": items})
 
-    # ==== Modo completo (tu BFS original) ====
-    cfg = CrawlerRunConfig(scraping_strategy=LXMLWebScrapingStrategy())
-    async with AsyncWebCrawler() as crawler:
+    # ==== Modo completo (BFS con Playwright) ====
+    cfg = CrawlerRunConfig(
+        scraping_strategy=LXMLWebScrapingStrategy(),
+        wait_until="domcontentloaded",
+        page_timeout=max(60_000, PAGE_TIMEOUT * 1000),  # ms
+    )
+    async with AsyncWebCrawler(max_concurrency=CRAWL_MAX_CONCURRENCY) as crawler:
         while queue and len(items) < limit:
             url, depth = queue.pop(0)
             if not url or url in seen:
@@ -291,7 +304,6 @@ async def crawl_site(inp: CrawlIn):
                     break
 
             if depth < max_depth:
-                # intenta sacar enlaces del objeto y del html crudo
                 links: Set[str] = set()
                 for key in ("links", "outlinks", "all_links", "extracted_links"):
                     val = getattr(res, key, None)
