@@ -897,7 +897,6 @@ app.post("/api/process-url", async (req, res) => {
   }
 });
 
-// ===== Crawl múltiple con compactado =====
 app.post("/api/crawl", async (req, res) => {
   try {
     const {
@@ -908,21 +907,306 @@ app.post("/api/crawl", async (req, res) => {
       deny = [],
       chunkSize = 1000,
       chunkOverlap = 200,
-      compact = true,
-      maxChars = 0,
-      showPageUrls = false,
-      keepInlineLinks = false,
+      compact = true,          // limpiar/deduplicar
+      maxChars = 0,            // presupuesto global (0 = sin límite)
+      showPageUrls = false,    // mostrar "URL: ..." en el documento final
+      keepInlineLinks = false  // mantener [texto](url) o <a href="...">
     } = req.body || {};
 
     if (!url) return res.status(400).json({ error: "Falta url" });
 
+    // ----------------- Helpers locales -----------------
+    const fastHash = (s) => {
+      let h = 2166136261 >>> 0;
+      for (let i = 0; i < s.length; i++) {
+        h ^= s.charCodeAt(i);
+        h = Math.imul(h, 16777619) >>> 0;
+      }
+      return h.toString(16);
+    };
+
+    const cleanMarkdown = (md) => {
+      if (!md) return "";
+    
+      // 0) Normaliza sin colapsar en exceso
+      let lines = md.replace(/\r/g, "").split("\n");
+    
+      // -------- Helpers 100% genéricos --------
+      const stripMdLinks = (s) => {
+        if (!s) return s;
+    
+        // 1) Quita imágenes Markdown por completo
+        s = s.replace(/!\[[^\]]*]\([^)]+\)/g, "");
+    
+        // 2) Enlaces Markdown [texto](url "títuloOpcional")
+        s = s.replace(
+          /\[([^\]]*?)\]\(\s*([^\s)]+)(?:\s+["'][^"']*["'])?\s*\)/gi,
+          (_, text = "", href = "") => {
+            const h = (href || "").trim().toLowerCase();
+            const isBad =
+              h.startsWith("javascript:") ||
+              h.startsWith("data:") ||
+              h.startsWith("#") ||
+              h.startsWith("mailto:") ||
+              h.startsWith("tel:") ||
+              h.includes("window.print");
+            if (isBad && !text.trim()) return "";
+            return text;
+          }
+        );
+    
+        // 3) Enlaces HTML <a href="...">texto</a>
+        s = s.replace(
+          /<a[^>]*href\s*=\s*"(javascript:[^"]+|data:[^"]+|#(?:[^"]*)?|mailto:[^"]+|tel:[^"]+)"[^>]*>.*?<\/a>/gi,
+          ""
+        );
+        s = s.replace(/<a[^>]*href\s*=\s*"[^"]+"[^>]*>(.*?)<\/a>/gi, "$1");
+    
+        return s;
+      };
+    
+      const wc = (s) => (s.trim() ? s.trim().split(/\s+/).length : 0);
+      const isTitleCaseWord = (w) => /^[A-Z][\p{L}\p{M}’'’-]*$/u.test(w);
+    
+      // Señales “estructuradas” (tablas, precios, horarios…)
+      const hasMoney = (s) => /[$€£¥]\s*\d/.test(s);
+      const isOnlyMoney = (s) => /^\s*[$€£¥]?\s*\d[\d.,]*(?:\s*[-–—]\s*[$€£¥]?\s*\d[\d.,]*)?\s*$/.test(s);
+      const hasTime = (s) => /\b\d{1,2}:\d{2}\s*(?:a\.m\.|p\.m\.|am|pm)\b/i.test(s);
+      const looksLikeTableRow = (s) =>
+        /\|/.test(s) || /^[\s\-|:]+$/.test(s);
+    
+      const isStructuredLine = (s) =>
+        hasMoney(s) || hasTime(s) || looksLikeTableRow(s) ||
+        ((s.match(/\d/g) || []).length >= 4 && wc(s) <= 20);
+    
+      // Encabezado/Sección (genérico)
+      const isHeading = (s) =>
+        /^#{1,6}\s+/.test(s) ||
+        (/^\*\*.+\*\*$/.test(s) && wc(s) <= 12) ||
+        (/^[A-Z0-9][A-Za-z0-9\s&/:'’–-]{0,60}$/.test(s) && !/[.!?]$/.test(s) && wc(s) <= 8);
+    
+      // --- FIX tablas de tarifas: rango de meses NO es heading ---
+      const MONTH = "(jan|feb|mar|apr|may|jun|june|jul|aug|sep|sept|oct|nov|dec)";
+      const isMonthRange = (s) =>
+        new RegExp(`^\\s*${MONTH}\\s*[–-]\\s*${MONTH}\\s*$`, "i").test(s);
+    
+      // filas con barras o patrones típicos de tabla
+      const looksLikeTableLine = (s) =>
+        /\|/.test(s) || /^[\s\-|:]+$/.test(s) || /\bM\s*[–-]\s*F\b/i.test(s) || /\bSat\s*[–-]\s*Sun\b/i.test(s);
+    
+      const isUtility = (t) => {
+        const raw = (t || "").trim();
+    
+        // Normaliza wrappers comunes de UI (#, **, comillas, paréntesis, etc.)
+        const s = raw
+          .replace(/^#+\s*/, "")
+          .replace(/^\*\*|\*\*$/g, "")
+          .replace(/^[\s"'“”‘’`()\[\]<>]+/, "")
+          .replace(/[\s"'“”‘’`()\[\]<>]+$/, "")
+          .replace(/\s+/g, " ")
+          .trim()
+          .toLowerCase();
+    
+        // Versión sin puntuación final para matches exactos como "print this page"
+        const sNoTrailPunct = s.replace(/[\s"'“”‘’).,:;!?-]+$/g, "");
+    
+        return (
+          // migas tipo "Home > ..."
+          /^home\s*>\s*/i.test(raw) ||
+    
+          // accesibilidad/UI
+          s.includes("skip to main content") ||
+          s.includes("opens the search dialog") ||
+          s.includes("opens a modal dialog") ||
+    
+          // utilitarios puros (con o sin ':', comillas, #, **, paréntesis…)
+          sNoTrailPunct === "share" ||
+          sNoTrailPunct === "print this page" ||
+    
+          // enlaces utilitarios
+          /^\s*(tel|mailto):/.test(s) ||
+          s === "search" ||
+          s === "menu" ||
+          s === "navigation"
+        );
+      };
+    
+      // Líneas tipo menú (bullets de items cortos en Title Case)
+      const isMenuBullet = (t) => {
+        if (!/^\s*[-*]\s+/.test(t)) return false;
+        const body = t.replace(/^\s*[-*]\s+/, "");
+        if (wc(body) <= 6 && !/[.!?]$/.test(body)) return true;
+        return false;
+      };
+    
+      // 1) Elimina markdown links globalmente (deja el texto visible)
+      lines = lines
+        .map(stripMdLinks)
+        .map((s) => s.replace(/\[\]\([^)]*\)/g, "")) // restos "[](...)"
+        .map((s) => s.replace(/javascript:\s*window\.print\s*\([^)]*\)/gi, ""));
+    
+      // 2) Barrido con estado: sección + bloque estructurado (+flag de tabla)
+      const out = [];
+      const seenBySection = new Map(); // key -> Set(lines)
+      let sectionKey = "GLOBAL";
+      let structuredBlock = false;
+      let inTable = false; // <<<<<< flag tabla
+    
+      const sectSet = (k) => {
+        if (!seenBySection.has(k)) seenBySection.set(k, new Set());
+        return seenBySection.get(k);
+      };
+    
+      for (let i = 0; i < lines.length; i++) {
+        let s = (lines[i] || "").trim();
+    
+        if (!s) {
+          // salir de modo tabla al encontrar línea en blanco
+          inTable = false;
+          if (out.length && out[out.length - 1] !== "") out.push("");
+          structuredBlock = false;
+          continue;
+        }
+    
+        if (/^site footer$/i.test(s)) break;
+        if (isUtility(s)) continue;
+        if (isMenuBullet(s)) continue;
+    
+        // --- Rango de meses forma parte de la tabla: no es heading ---
+        if (isMonthRange(s)) {
+          inTable = true;
+          structuredBlock = true;
+          out.push(s);
+          continue;
+        }
+    
+        // Headings normales (solo si no estamos dentro de una tabla)
+        if (!inTable && isHeading(s)) {
+          sectionKey = s.replace(/\s+/g, " ").slice(0, 80);
+          structuredBlock = false;
+          const set = sectSet(sectionKey);
+          if (!set.has(s)) { out.push(s); set.add(s); }
+          continue;
+        }
+    
+        // Detecta líneas de tabla para mantener el modo tabla activo
+        if (looksLikeTableLine(s)) {
+          inTable = true;
+          structuredBlock = true;
+        }
+    
+        if (isStructuredLine(s)) structuredBlock = true;
+    
+        if (!structuredBlock) {
+          const letters = (s.match(/[\p{L}\p{M}]/gu) || []).length;
+          const glyphs = s.replace(/\s/g, "").length;
+          if (letters < 3 && !hasMoney(s)) continue;
+          if (letters < glyphs * 0.4 && !hasMoney(s)) continue;
+    
+          // items titulo cortos (menú)
+          const words = s.split(/\s+/);
+          const ratio = words.filter(isTitleCaseWord).length / Math.max(words.length, 1);
+          if (words.length <= 5 && !/[.!?]$/.test(s) && ratio >= 0.8 && !hasMoney(s) && !hasTime(s)) {
+            continue;
+          }
+        }
+    
+        const set = sectSet(sectionKey);
+        const isUndedupeableInBlock =
+          structuredBlock && (hasMoney(s) || isOnlyMoney(s) || hasTime(s) || looksLikeTableRow(s));
+    
+        if (!isUndedupeableInBlock) {
+          if (set.has(s)) continue;
+          set.add(s);
+        }
+    
+        out.push(s);
+      }
+    
+      return out
+        .join("\n")
+        .replace(/\n{3,}/g, "\n\n")
+        .replace(/\*{2,}\s*([^\*]+?)\s*\*{2,}/g, "**$1**")
+        .trim();
+    };
+    
+
+    const dedupeParagraphs = (texts) => {
+      const seen = new Set();
+      const out = [];
+
+      const isKeepableShort = (p) => {
+        const t = (p || "").trim();
+        if (!t) return false;
+        if (/^#{1,6}\s+/.test(t)) return true;        // encabezado markdown
+        if (/:$/.test(t)) return true;                // termina en ":"
+        if (/^[A-Z][A-Za-zÀ-ÿ’'’-]+(?:[ ,\-][A-Za-zÀ-ÿ’'’-]+){0,4}$/.test(t)) return true; // catálogos
+        if (t.length >= 20) return true;              // frase normal
+        return false;
+      };
+
+      for (const t of texts) {
+        const paras = String(t || "").split(/\n{2,}/g);
+        for (let p of paras) {
+          const raw = (p || "").trim();
+          if (!raw) continue;
+
+          const norm = raw.replace(/\s+/g, " ").trim().toLowerCase();
+          if (norm.length < 10) continue;
+
+          const h = fastHash(norm);
+          if (seen.has(h)) continue;
+
+          if (raw.length < 60 && !isKeepableShort(raw)) continue;
+
+          seen.add(h);
+          out.push(raw);
+        }
+      }
+      return out.join("\n\n").trim();
+    };
+
+    const applyBudget = (str, budget) => {
+      const b = Number(budget);
+      if (!Number.isFinite(b) || b <= 0) return str;
+      if (str.length <= b) return str;
+      const head = Math.floor(b * 0.7);
+      const tail = b - head;
+      return str.slice(0, head) + "\n\n[...] (recortado)\n\n" + str.slice(-tail);
+    };
+
+    // NUEVO: pasada final para quitar enlaces inline y líneas URL si procede
+    const stripLinksFromText = (s, { stripUrlLines = true } = {}) => {
+      if (!s) return s;
+      // quita imágenes
+      s = s.replace(/!\[[^\]]*]\([^)]+\)/g, "");
+      // markdown links -> texto
+      s = s.replace(/\[([^\]]*?)\]\(\s*([^\s)]+)(?:\s+["'][^"']*["'])?\s*\)/gi, (_, txt = "") => (txt || "").trim());
+      // html links -> texto
+      s = s.replace(/<a[^>]*href\s*=\s*"[^"]+"[^>]*>(.*?)<\/a>/gis, "$1").replace(/<\/?a\b[^>]*>/gi, "");
+      if (stripUrlLines) {
+        s = s
+          .split("\n")
+          .filter((line) => {
+            const t = line.trim();
+            if (/^URL:\s*https?:\/\//i.test(t)) return false;
+            if (/^(https?:\/\/|www\.)\S+$/i.test(t)) return false;
+            return true;
+          })
+          .join("\n");
+      }
+      return s;
+    };
+
+    // --------------- 1) Pedimos páginas ----------------
     let rawPages = [];
     if (engine === "crawl4ai") {
-      rawPages = await crawlWithCrawl4AI({ url, limit, maxDepth, deny });
+      rawPages = await crawlWithCrawl4AI({ url, limit, maxDepth, deny }); // microservicio local
     } else {
-      rawPages = await crawlWithFirecrawl({ url, limit, maxDepth });
+      rawPages = await crawlWithFirecrawl({ url, limit, maxDepth });       // SaaS
     }
 
+    // --------------- 2) Normalizar SIEMPRE a strings ---------------
     const normalizePage = (p) => {
       const urlStr =
         (p && typeof p.url === "string" && p.url) ||
@@ -946,8 +1230,7 @@ app.post("/api/crawl", async (req, res) => {
 
       let md = "";
       if (p && typeof p.markdown === "string") md = p.markdown;
-      else if (p && p.markdown && typeof p.markdown.raw_markdown === "string")
-        md = p.markdown.raw_markdown;
+      else if (p && p.markdown && typeof p.markdown.raw_markdown === "string") md = p.markdown.raw_markdown;
 
       let txt = "";
       if (!md) {
@@ -962,68 +1245,75 @@ app.post("/api/crawl", async (req, res) => {
       return {
         url: String(urlStr || url),
         title: String(titleStr || ""),
-        markdown: String(md || txt || fromHtml || ""),
+        markdown: String(md || txt || fromHtml || "")
       };
     };
 
     const pages = (Array.isArray(rawPages) ? rawPages : []).map(normalizePage);
-    const cleaned = (compact
-      ? pages.map((p) => ({ ...p, markdown: cleanMarkdown(p.markdown) }))
-      : pages
-    ).filter((p) => p.markdown && p.markdown.trim().length > 0);
 
+    // --------------- 3) Limpiar + filtrar usables ---------------
+    const cleaned = (compact
+      ? pages.map(p => ({ ...p, markdown: cleanMarkdown(p.markdown) }))
+      : pages
+    ).filter(p => p.markdown && p.markdown.trim().length > 0);
+
+    console.log(`[crawl] pages totales: ${pages.length} | con texto util: ${cleaned.length}`);
     if (cleaned.length === 0) {
       return res.status(422).json({ error: "No se pudo extraer texto del crawl" });
     }
 
+    // --- 4) Dedupe y presupuesto (igual que antes) ---
     const dedupedBody = compact
-      ? dedupeParagraphs(cleaned.map((p) => p.markdown))
-      : cleaned.map((p) => p.markdown).join("\n\n");
+    ? dedupeParagraphs(cleaned.map(p => p.markdown))
+    : cleaned.map(p => p.markdown).join("\n\n");
 
+    // ❗ NUEVO: construir cabeceras sin "===== PAGE N =====" salvo que showPageUrls sea true
     const headers = cleaned
-      .map((p, i) => {
-        const parts = [];
-        if (showPageUrls) parts.push(`===== PAGE ${i + 1} =====`);
-        if (p.title) parts.push(`# ${p.title}`);
-        if (showPageUrls) parts.push(`URL: ${p.url}`);
-        const h = parts.join("\n").trim();
-        return h ? h : null;
-      })
-      .filter(Boolean)
-      .join("\n\n");
+    .map((p, i) => {
+      const parts = [];
+      if (showPageUrls) parts.push(`===== PAGE ${i + 1} =====`);
+      if (p.title) parts.push(`# ${p.title}`);
+      if (showPageUrls) parts.push(`URL: ${p.url}`);
+      const h = parts.join("\n").trim();
+      return h ? h : null;
+    })
+    .filter(Boolean)
+    .join("\n\n");
 
     let allText = `${headers}\n\n${dedupedBody}`.trim();
+
+    // Pasada final para ocultar enlaces inline / líneas URL (como ya tenías)
     if (!keepInlineLinks || !showPageUrls) {
-      allText = stripLinksFromText(allText, { stripUrlLines: !showPageUrls });
-    }
-    if (!showPageUrls) {
-      allText = allText
-        .replace(/^\s*===== PAGE \d+ =====\s*$/gm, "")
-        .replace(/\n{3,}/g, "\n\n")
-        .trim();
-    }
-    if (compact && Number(maxChars) > 0) {
-      allText = applyBudget(allText, Number(maxChars));
+    allText = stripLinksFromText(allText, { stripUrlLines: !showPageUrls });
     }
 
+    // ❗ NUEVO: por seguridad, si no mostramos URLs, elimina cualquier línea residual "===== PAGE N ====="
+    if (!showPageUrls) {
+    allText = allText
+      .replace(/^\s*===== PAGE \d+ =====\s*$/gm, "")
+      .replace(/\n{3,}/g, "\n\n")
+      .trim();
+    }
+
+    if (compact && Number(maxChars) > 0) {
+    allText = applyBudget(allText, Number(maxChars));
+    }
+
+
+    // --------------- 5) Chunkificar como un PDF ---------------
     const parts = textToChunks(allText, Number(chunkSize), Number(chunkOverlap));
+
+    // --------------- 6) Guardar en memoria como UNA sola fuente ---------------
     const sourceId = generateId("src");
     const chunks = parts.map((content, i) => ({
       id: `c${i + 1}`,
       sourceId,
       content,
-      index: i,
+      index: i
     }));
     CHUNKS.set(sourceId, chunks);
 
-    const name = (() => {
-      try {
-        return new URL(url).hostname;
-      } catch {
-        return url;
-      }
-    })();
-
+    const name = (() => { try { return new URL(url).hostname; } catch { return url; } })();
     const source = {
       id: sourceId,
       type: "crawl",
@@ -1031,7 +1321,7 @@ app.post("/api/crawl", async (req, res) => {
       url,
       status: "completed",
       chunks,
-      createdAt: new Date().toISOString(),
+      createdAt: new Date().toISOString()
     };
 
     return res.json({ ok: true, sources: [source] });
