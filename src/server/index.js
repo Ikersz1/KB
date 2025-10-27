@@ -28,22 +28,20 @@ const CRAWL4AI_URL = process.env.CRAWL4AI_URL || "http://127.0.0.1:8002";
 const FIRECRAWL_API_KEY = process.env.FIRECRAWL_API_KEY || "";
 
 // ===== Middlewares =====
-const ALLOWED_ORIGINS = [
-  "http://localhost:5173",
-  "http://localhost:4173",
-  // "https://tu-front.vercel.app",
-];
-app.use(
-  cors({
-    origin(origin, cb) {
-      if (!origin) return cb(null, true);
-      if (ALLOWED_ORIGINS.includes(origin) || ALLOWED_ORIGINS.includes("*"))
-        return cb(null, true);
-      return cb(null, false);
-    },
-    credentials: false,
-  })
-);
+// server/index.js (o src/server/index.js según tu estructura)
+const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || 'http://localhost:5173,http://localhost:4173')
+  .split(',')
+  .map(s => s.trim());
+
+app.use(cors({
+  origin(origin, cb) {
+    if (!origin) return cb(null, true);
+    if (ALLOWED_ORIGINS.includes('*') || ALLOWED_ORIGINS.includes(origin)) {
+      return cb(null, true);
+    }
+    return cb(null, false);
+  }
+}));
 app.use(express.json({ limit: "10mb" }));
 
 // ===== Almacen en memoria =====
