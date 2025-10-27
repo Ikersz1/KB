@@ -1,5 +1,6 @@
 # services/crawl4ai_service.py
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware   # <-- NUEVO
 from pydantic import BaseModel, Field
 from typing import List
 from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode
@@ -9,6 +10,18 @@ from crawl4ai import AsyncWebCrawler, CrawlerRunConfig
 from crawl4ai.content_scraping_strategy import LXMLWebScrapingStrategy
 
 app = FastAPI(title="Crawl4AI Microservice", version="0.1.0")
+
+# CORS abierto (ajusta orígenes si quieres limitar)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"], allow_credentials=False,
+    allow_methods=["*"], allow_headers=["*"],
+)
+
+@app.get("/health")
+def health():
+    return {"ok": True}
+
 
 # ---------- Schemas ----------
 class FetchIn(BaseModel):
