@@ -1,17 +1,21 @@
-# Node
-node_modules
+# Build artefacts
 dist
 .build
 .vercel
+
 # Mac
 .DS_Store
-# Vite
+
+# Vite / local
 *.local
+
 # Logs
 *.log
+
 # Env
 .env
 .env.*
+
 # Python
 __pycache__/
 *.py[cod]
@@ -19,5 +23,9 @@ __pycache__/
 .venv/
 services/.venv/
 services/__pycache__/
+
+# Node
+node_modules/
+
 # Misc
 *.sqlite
