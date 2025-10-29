@@ -199,8 +199,8 @@ async def fetch_one(inp: FetchIn):
 
     cfg = CrawlerRunConfig(
     scraping_strategy=LXMLWebScrapingStrategy(),
-    wait_until="domcontentloaded",
-    page_timeout=max(60_000, PAGE_TIMEOUT * 1000),  # ms
+    wait_until="commit",     # <= recibe headers y no espera DOM
+    page_timeout=max(120_000, PAGE_TIMEOUT * 1000),
     )
     async with AsyncWebCrawler(max_concurrency=int(os.getenv("CRAWL_MAX_CONCURRENCY","2"))) as crawler:
         res = await crawler.arun(url=inp.url, config=cfg)
@@ -269,9 +269,9 @@ async def crawl_site(inp: CrawlIn):
 
     # ==== Modo completo (BFS con Playwright) ====
     cfg = CrawlerRunConfig(
-        scraping_strategy=LXMLWebScrapingStrategy(),
-        wait_until="domcontentloaded",
-        page_timeout=max(60_000, PAGE_TIMEOUT * 1000),  # ms
+    scraping_strategy=LXMLWebScrapingStrategy(),
+    wait_until="commit",     # <= recibe headers y no espera DOM
+    page_timeout=max(120_000, PAGE_TIMEOUT * 1000),
     )
     async with AsyncWebCrawler(max_concurrency=CRAWL_MAX_CONCURRENCY) as crawler:
         while queue and len(items) < limit:
