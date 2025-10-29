@@ -24,7 +24,11 @@ setGlobalDispatcher(
 // ===== App / clientes / config =====
 const app = express();
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-const CRAWL4AI_URL = process.env.CRAWL4AI_URL || "http://127.0.0.1:8002";
+// Sanea la base (quita barras finales) y crea un helper para unir paths
+const RAW_CRAWL4AI_URL = process.env.CRAWL4AI_URL || "http://127.0.0.1:8002";
+const CRAWL4AI_BASE = RAW_CRAWL4AI_URL.replace(/\/+$/g, "");
+const crawl4 = (path) => new URL(path, CRAWL4AI_BASE).toString();
+
 const FIRECRAWL_API_KEY = process.env.FIRECRAWL_API_KEY || "";
 
 // ===== Middlewares =====
@@ -792,11 +796,11 @@ async function crawlWithFirecrawl({ url, limit = 50, maxDepth = 2 }) {
   return items;
 }
 async function crawlWithCrawl4AI({ url, limit = 50, maxDepth = 2, deny = [] }) {
-  const resp = await fetch(`${CRAWL4AI_URL}/crawl`, {
+  const resp = await fetch(crawl4("/crawl"), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ url, limit, maxDepth, deny }),
-  });
+  });  
   const text = await resp.text();
   let data;
   try {
@@ -811,11 +815,12 @@ async function crawlWithCrawl4AI({ url, limit = 50, maxDepth = 2, deny = [] }) {
   return items;
 }
 async function fetchOneWithCrawl4AI(url) {
-  const resp = await fetch(`${CRAWL4AI_URL}/fetch`, {
+  const resp = await fetch(crawl4("/fetch"), {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ url }),
   });
+  
   const text = await resp.text();
   let data;
   try {

@@ -197,14 +197,14 @@ async def fetch_one(inp: FetchIn):
         txt = strip_html(html_text) if html_text else ""
         return FetchOut(ok=True, data=FetchOutItem(url=url, title="", markdown=txt))
 
-    # Modo completo (Playwright)
     cfg = CrawlerRunConfig(
-        scraping_strategy=LXMLWebScrapingStrategy(),
-        wait_until="domcontentloaded",
-        page_timeout=max(60_000, PAGE_TIMEOUT * 1000),  # ms
+    scraping_strategy=LXMLWebScrapingStrategy(),
+    wait_until="domcontentloaded",
+    page_timeout=max(60_000, PAGE_TIMEOUT * 1000),  # ms
     )
-    async with AsyncWebCrawler(max_concurrency=CRAWL_MAX_CONCURRENCY) as crawler:
+    async with AsyncWebCrawler(max_concurrency=int(os.getenv("CRAWL_MAX_CONCURRENCY","2"))) as crawler:
         res = await crawler.arun(url=inp.url, config=cfg)
+
 
     txt = pick_text_from_obj(res)
     ttl = _title(res)
