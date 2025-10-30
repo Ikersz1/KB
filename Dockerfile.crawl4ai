@@ -1,0 +1,9 @@
+cat > Dockerfile.crawl4ai << 'DOCK'
+FROM python:3.11-slim
+WORKDIR /app
+RUN pip install --no-cache-dir --upgrade pip \
+ && pip install --no-cache-dir fastapi "uvicorn[standard]" crawl4ai lxml
+COPY services/crawl4ai_service.py services/crawl4ai_service.py
+EXPOSE 8003
+CMD ["uvicorn", "services.crawl4ai_service:app", "--host", "0.0.0.0", "--port", "8003"]
+DOCK
