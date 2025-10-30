@@ -1,0 +1,24 @@
+cat > docker-compose.yml << 'YML'
+services:
+  crawl4ai:
+    build:
+      context: .
+      dockerfile: Dockerfile.crawl4ai
+    container_name: crawl4ai
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8003:8003"   # solo local en el VPS
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile.app
+    container_name: kb-app
+    restart: unless-stopped
+    env_file:
+      - .env
+    depends_on:
+      - crawl4ai
+    ports:
+      - "80:4000"               # expone la web en el puerto 80 público
+YML
